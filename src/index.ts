@@ -11,7 +11,7 @@ import { env } from './env.js';
 const commandByName = new Map(commands.map((command) => [command.data.name, command]));
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
 client.once(Events.ClientReady, (readyClient) => {
