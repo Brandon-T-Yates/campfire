@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { OpusEncoder } from '@discordjs/opus';
 import {
   EndBehaviorType,
   VoiceConnectionStatus,
@@ -7,26 +8,30 @@ import {
   type VoiceConnection,
 } from '@discordjs/voice';
 import type { Client } from 'discord.js';
-import prism from 'prism-media';
 import { WavWriter } from './wavWriter.js';
 
 type ActiveBurst = {
   stream: AudioReceiveStream;
-  decoder: prism.opus.Decoder;
+  decoder: OpusEncoder;
 };
 
 type SpeakerRecording = {
+  userId: string;
   writer: WavWriter;
   loggedRecording: boolean;
   burst: ActiveBurst | null;
+  packetsReceived: number;
+  packetsDecoded: number;
+  decodeErrors: number;
+  pcmBytes: number;
 };
 
 type ReceiveSession = {
+  client: Client;
   connection: VoiceConnection;
   sessionDir: string;
   speakers: Map<string, SpeakerRecording>;
   onStart: (userId: string) => void;
-  onEnd: (userId: string) => void;
   onDisconnect: () => void;
 };
 
@@ -67,17 +72,21 @@ function stopBurst(speaker: SpeakerRecording) {
   if (!speaker.burst) {
     return;
   }
-  const { stream, decoder } = speaker.burst;
+  const { stream } = speaker.burst;
   speaker.burst = null;
-  stream.unpipe(decoder);
-  decoder.removeAllListeners();
   stream.removeAllListeners();
   stream.destroy();
-  decoder.destroy();
 }
 
 function savedAudioPath(filePath: string): string {
   return path.relative(process.cwd(), filePath).split(path.sep).join('/');
+}
+
+function decodeSuccessPercent(speaker: SpeakerRecording): string {
+  if (speaker.packetsReceived === 0) {
+    return '100.0';
+  }
+  return ((speaker.packetsDecoded / speaker.packetsReceived) * 100).toFixed(1);
 }
 
 export function startVoiceReceive(connection: VoiceConnection, client: Client) {
@@ -92,9 +101,14 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
     let speaker = speakers.get(userId);
     if (!speaker) {
       speaker = {
+        userId,
         writer: new WavWriter(path.join(sessionDir, `${userId}.wav`)),
         loggedRecording: false,
         burst: null,
+        packetsReceived: 0,
+        packetsDecoded: 0,
+        decodeErrors: 0,
+        pcmBytes: 0,
       };
       speakers.set(userId, speaker);
     }
@@ -106,28 +120,33 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
     const stream = connection.receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterSilence,
-        duration: 200,
+        duration: 1000,
       },
     });
-    const decoder = new prism.opus.Decoder({
-      frameSize: 960,
-      channels: 2,
-      rate: 48_000,
-    });
+    const decoder = new OpusEncoder(48_000, 2);
     speaker.burst = { stream, decoder };
 
-    decoder.on('data', (pcm: Buffer) => {
-      if (!speaker.loggedRecording) {
-        speaker.loggedRecording = true;
-        void speakerLabel(client, userId).then((label) => {
-          console.log(`Recording audio for: ${label}`);
-        });
+    stream.on('data', (packet: Buffer) => {
+      speaker.packetsReceived += 1;
+      try {
+        const pcm = decoder.decode(packet);
+        speaker.packetsDecoded += 1;
+        speaker.pcmBytes += pcm.length;
+        if (!speaker.loggedRecording) {
+          speaker.loggedRecording = true;
+          void speakerLabel(client, userId).then((label) => {
+            console.log(`Recording audio for: ${label}`);
+          });
+        }
+        speaker.writer.writePcm(pcm);
+      } catch (error) {
+        speaker.decodeErrors += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `Dropped corrupt Opus packet for ${userId}: ${packet.length} bytes`,
+        );
+        console.warn(message);
       }
-      speaker.writer.writePcm(pcm);
-    });
-
-    decoder.on('error', (error: Error) => {
-      console.error(`Opus decode error for ${userId}`, error);
     });
 
     stream.on('error', (error: Error) => {
@@ -139,15 +158,6 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
         stopBurst(speaker);
       }
     });
-
-    stream.pipe(decoder);
-  };
-
-  const onEnd = (userId: string) => {
-    const speaker = speakers.get(userId);
-    if (speaker) {
-      stopBurst(speaker);
-    }
   };
 
   const onDisconnect = () => {
@@ -155,16 +165,15 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
   };
 
   connection.receiver.speaking.on('start', onStart);
-  connection.receiver.speaking.on('end', onEnd);
   connection.on(VoiceConnectionStatus.Disconnected, onDisconnect);
   connection.on(VoiceConnectionStatus.Destroyed, onDisconnect);
 
   sessions.set(guildId, {
+    client,
     connection,
     sessionDir,
     speakers,
     onStart,
-    onEnd,
     onDisconnect,
   });
 }
@@ -178,7 +187,6 @@ export async function stopVoiceReceive(guildId: string) {
   sessions.delete(guildId);
 
   session.connection.receiver.speaking.off('start', session.onStart);
-  session.connection.receiver.speaking.off('end', session.onEnd);
   session.connection.off(VoiceConnectionStatus.Disconnected, session.onDisconnect);
   session.connection.off(VoiceConnectionStatus.Destroyed, session.onDisconnect);
 
@@ -186,6 +194,13 @@ export async function stopVoiceReceive(guildId: string) {
   for (const speaker of session.speakers.values()) {
     stopBurst(speaker);
     await speaker.writer.close();
+    const label = await speakerLabel(session.client, speaker.userId);
+    console.log(`Audio stats for ${label}:`);
+    console.log(`Packets received: ${speaker.packetsReceived}`);
+    console.log(`Packets decoded: ${speaker.packetsDecoded}`);
+    console.log(`Decode errors: ${speaker.decodeErrors}`);
+    console.log(`Decode success: ${decodeSuccessPercent(speaker)}%`);
+    console.log(`PCM bytes written: ${speaker.pcmBytes}`);
     saved.push(savedAudioPath(speaker.writer.filePath));
   }
 
