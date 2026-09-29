@@ -1,6 +1,5 @@
 import {
   ChannelType,
-  GuildMember,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
 } from 'discord.js';
@@ -49,10 +48,8 @@ async function startSession(interaction: ChatInputCommandInteraction) {
     return;
   }
 
-  const member =
-    interaction.member instanceof GuildMember
-      ? interaction.member
-      : await interaction.guild!.members.fetch(interaction.user.id);
+  const guild = await interaction.client.guilds.fetch(guildId);
+  const member = await guild.members.fetch(interaction.user.id);
 
   const channel = member.voice.channel;
   if (
