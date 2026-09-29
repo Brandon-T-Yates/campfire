@@ -9,6 +9,7 @@ import {
   joinVoiceChannel,
   VoiceConnectionStatus,
 } from '@discordjs/voice';
+import { startVoiceReceive, stopVoiceReceive } from '../voiceReceive.js';
 
 export const session = {
   data: new SlashCommandBuilder()
@@ -80,6 +81,7 @@ async function startSession(interaction: ChatInputCommandInteraction) {
     return;
   }
 
+  startVoiceReceive(connection, interaction.client);
   await interaction.reply('🔥 Campfire is lit. Session started.');
 }
 
@@ -90,6 +92,7 @@ async function stopSession(interaction: ChatInputCommandInteraction) {
     return;
   }
 
+  stopVoiceReceive(interaction.guildId!);
   connection.destroy();
   await interaction.reply('🔥 Campfire has gone quiet. Session ended.');
 }
