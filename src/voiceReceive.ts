@@ -1,6 +1,6 @@
+import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
-import { OpusEncoder } from '@discordjs/opus';
 import {
   EndBehaviorType,
   VoiceConnectionStatus,
@@ -10,9 +10,12 @@ import {
 import type { Client } from 'discord.js';
 import { WavWriter } from './wavWriter.js';
 
+const require = createRequire(import.meta.url);
+const { OpusEncoder } = require('@discordjs/opus') as typeof import('@discordjs/opus');
+
 type ActiveBurst = {
   stream: AudioReceiveStream;
-  decoder: OpusEncoder;
+  decoder: InstanceType<typeof OpusEncoder>;
 };
 
 type SpeakerRecording = {
