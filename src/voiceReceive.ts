@@ -28,11 +28,12 @@ type SpeechSegment = {
 type ActiveBurst = {
   stream: AudioReceiveStream;
   decoder: InstanceType<typeof OpusEncoder>;
-  startMs: number;
+  startMs: number | null;
   username: string;
   packetsReceived: number;
+  packetsDecoded: number;
   decodeErrors: number;
-  pcmStartBytes: number;
+  pcmStartBytes: number | null;
 };
 
 type SpeakerRecording = {
@@ -111,22 +112,31 @@ function closeBurst(session: ReceiveSession, speaker: SpeakerRecording) {
     return;
   }
   speaker.burst = null;
+  burst.stream.removeAllListeners();
+  burst.stream.destroy();
 
-  const endMs = elapsedMs(session.clockStartNs);
+  if (
+    burst.packetsDecoded === 0 ||
+    burst.startMs === null ||
+    burst.pcmStartBytes === null
+  ) {
+    return;
+  }
+
+  const audioStartMs = pcmBytesToAudioMs(burst.pcmStartBytes);
+  const audioEndMs = pcmBytesToAudioMs(speaker.pcmBytes);
+  const durationMs = Math.max(0, audioEndMs - audioStartMs);
   session.segments.push({
     userId: speaker.userId,
     username: burst.username,
     startMs: burst.startMs,
-    endMs,
-    durationMs: Math.max(0, endMs - burst.startMs),
+    endMs: burst.startMs + durationMs,
+    durationMs,
     packetCount: burst.packetsReceived,
     decodeErrorCount: burst.decodeErrors,
-    audioStartMs: pcmBytesToAudioMs(burst.pcmStartBytes),
-    audioEndMs: pcmBytesToAudioMs(speaker.pcmBytes),
+    audioStartMs,
+    audioEndMs,
   });
-
-  burst.stream.removeAllListeners();
-  burst.stream.destroy();
 }
 
 function savedAudioPath(filePath: string): string {
@@ -200,11 +210,12 @@ async function startBurst(session: ReceiveSession, userId: string) {
   const burst: ActiveBurst = {
     stream,
     decoder,
-    startMs: elapsedMs(session.clockStartNs),
+    startMs: null,
     username: 'unknown',
     packetsReceived: 0,
+    packetsDecoded: 0,
     decodeErrors: 0,
-    pcmStartBytes: speaker.pcmBytes,
+    pcmStartBytes: null,
   };
   speaker.burst = burst;
   void speakerUsername(session.client, userId).then((username) => {
@@ -216,6 +227,11 @@ async function startBurst(session: ReceiveSession, userId: string) {
     burst.packetsReceived += 1;
     try {
       const pcm = burst.decoder.decode(packet);
+      if (burst.packetsDecoded === 0) {
+        burst.startMs = elapsedMs(session.clockStartNs);
+        burst.pcmStartBytes = speaker.pcmBytes;
+      }
+      burst.packetsDecoded += 1;
       speaker.packetsDecoded += 1;
       speaker.pcmBytes += pcm.length;
       if (!speaker.loggedRecording) {
