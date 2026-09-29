@@ -92,7 +92,7 @@ async function stopSession(interaction: ChatInputCommandInteraction) {
     return;
   }
 
-  stopVoiceReceive(interaction.guildId!);
+  await stopVoiceReceive(interaction.guildId!);
   connection.destroy();
   await interaction.reply('🔥 Campfire has gone quiet. Session ended.');
 }

@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   EndBehaviorType,
   VoiceConnectionStatus,
@@ -5,17 +7,24 @@ import {
   type VoiceConnection,
 } from '@discordjs/voice';
 import type { Client } from 'discord.js';
+import prism from 'prism-media';
+import { WavWriter } from './wavWriter.js';
 
-type SpeakerStats = {
-  packets: number;
-  bytes: number;
-  loggedReceive: boolean;
+type ActiveBurst = {
   stream: AudioReceiveStream;
+  decoder: prism.opus.Decoder;
+};
+
+type SpeakerRecording = {
+  writer: WavWriter;
+  loggedRecording: boolean;
+  burst: ActiveBurst | null;
 };
 
 type ReceiveSession = {
   connection: VoiceConnection;
-  speakers: Map<string, SpeakerStats>;
+  sessionDir: string;
+  speakers: Map<string, SpeakerRecording>;
   onStart: (userId: string) => void;
   onEnd: (userId: string) => void;
   onDisconnect: () => void;
@@ -32,27 +41,65 @@ async function speakerLabel(client: Client, userId: string): Promise<string> {
   return `${name} (${userId})`;
 }
 
-function closeSpeaker(speakers: Map<string, SpeakerStats>, userId: string) {
-  const stats = speakers.get(userId);
-  if (!stats) {
+function createSessionFolder(): string {
+  const tmpRoot = path.join(process.cwd(), 'tmp');
+  fs.mkdirSync(tmpRoot, { recursive: true });
+
+  const day = new Date().toISOString().slice(0, 10);
+  const prefix = `session-${day}-`;
+  let max = 0;
+  for (const name of fs.readdirSync(tmpRoot)) {
+    if (!name.startsWith(prefix)) {
+      continue;
+    }
+    const suffix = name.slice(prefix.length);
+    if (/^\d+$/.test(suffix)) {
+      max = Math.max(max, Number(suffix));
+    }
+  }
+
+  const folder = path.join(tmpRoot, `${prefix}${String(max + 1).padStart(3, '0')}`);
+  fs.mkdirSync(folder);
+  return folder;
+}
+
+function stopBurst(speaker: SpeakerRecording) {
+  if (!speaker.burst) {
     return;
   }
-  stats.stream.destroy();
-  speakers.delete(userId);
+  const { stream, decoder } = speaker.burst;
+  speaker.burst = null;
+  stream.unpipe(decoder);
+  decoder.removeAllListeners();
+  stream.removeAllListeners();
+  stream.destroy();
+  decoder.destroy();
+}
+
+function savedAudioPath(filePath: string): string {
+  return path.relative(process.cwd(), filePath).split(path.sep).join('/');
 }
 
 export function startVoiceReceive(connection: VoiceConnection, client: Client) {
   const guildId = connection.joinConfig.guildId;
-  stopVoiceReceive(guildId);
+  void stopVoiceReceive(guildId);
 
-  const speakers = new Map<string, SpeakerStats>();
+  const sessionDir = createSessionFolder();
+  const speakers = new Map<string, SpeakerRecording>();
+  console.log(`Session audio folder: ${savedAudioPath(sessionDir)}`);
 
   const onStart = (userId: string) => {
-    void speakerLabel(client, userId).then((label) => {
-      console.log(`Speaker started: ${label}`);
-    });
+    let speaker = speakers.get(userId);
+    if (!speaker) {
+      speaker = {
+        writer: new WavWriter(path.join(sessionDir, `${userId}.wav`)),
+        loggedRecording: false,
+        burst: null,
+      };
+      speakers.set(userId, speaker);
+    }
 
-    if (speakers.has(userId)) {
+    if (speaker.burst) {
       return;
     }
 
@@ -62,48 +109,49 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
         duration: 200,
       },
     });
+    const decoder = new prism.opus.Decoder({
+      frameSize: 960,
+      channels: 2,
+      rate: 48_000,
+    });
+    speaker.burst = { stream, decoder };
 
-    const stats: SpeakerStats = {
-      packets: 0,
-      bytes: 0,
-      loggedReceive: false,
-      stream,
-    };
-    speakers.set(userId, stats);
-
-    stream.on('data', (chunk: Buffer) => {
-      stats.packets += 1;
-      stats.bytes += chunk.length;
-      if (!stats.loggedReceive) {
-        stats.loggedReceive = true;
-        console.log(`Receiving audio from: ${userId}`);
+    decoder.on('data', (pcm: Buffer) => {
+      if (!speaker.loggedRecording) {
+        speaker.loggedRecording = true;
+        void speakerLabel(client, userId).then((label) => {
+          console.log(`Recording audio for: ${label}`);
+        });
       }
+      speaker.writer.writePcm(pcm);
     });
 
-    stream.once('end', () => {
-      if (speakers.get(userId)?.stream === stream) {
-        speakers.delete(userId);
-      }
+    decoder.on('error', (error: Error) => {
+      console.error(`Opus decode error for ${userId}`, error);
     });
 
     stream.on('error', (error: Error) => {
       console.error(`Audio stream error for ${userId}`, error);
     });
+
+    stream.once('end', () => {
+      if (speaker.burst?.stream === stream) {
+        stopBurst(speaker);
+      }
+    });
+
+    stream.pipe(decoder);
   };
 
   const onEnd = (userId: string) => {
-    const stats = speakers.get(userId);
-    if (stats) {
-      console.log(`Packets received: ${stats.packets} (${stats.bytes} bytes)`);
+    const speaker = speakers.get(userId);
+    if (speaker) {
+      stopBurst(speaker);
     }
-    void speakerLabel(client, userId).then((label) => {
-      console.log(`Speaker stopped: ${label}`);
-    });
-    closeSpeaker(speakers, userId);
   };
 
   const onDisconnect = () => {
-    stopVoiceReceive(guildId);
+    void stopVoiceReceive(guildId);
   };
 
   connection.receiver.speaking.on('start', onStart);
@@ -113,6 +161,7 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
 
   sessions.set(guildId, {
     connection,
+    sessionDir,
     speakers,
     onStart,
     onEnd,
@@ -120,7 +169,7 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
   });
 }
 
-export function stopVoiceReceive(guildId: string) {
+export async function stopVoiceReceive(guildId: string) {
   const session = sessions.get(guildId);
   if (!session) {
     return;
@@ -133,7 +182,14 @@ export function stopVoiceReceive(guildId: string) {
   session.connection.off(VoiceConnectionStatus.Disconnected, session.onDisconnect);
   session.connection.off(VoiceConnectionStatus.Destroyed, session.onDisconnect);
 
-  for (const userId of [...session.speakers.keys()]) {
-    closeSpeaker(session.speakers, userId);
+  const saved: string[] = [];
+  for (const speaker of session.speakers.values()) {
+    stopBurst(speaker);
+    await speaker.writer.close();
+    saved.push(savedAudioPath(speaker.writer.filePath));
+  }
+
+  for (const filePath of saved) {
+    console.log(`Saved audio: ${filePath}`);
   }
 }
