@@ -13,9 +13,26 @@ import { WavWriter } from './wavWriter.js';
 const require = createRequire(import.meta.url);
 const { OpusEncoder } = require('@discordjs/opus') as typeof import('@discordjs/opus');
 
+type SpeechSegment = {
+  userId: string;
+  username: string;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  packetCount: number;
+  decodeErrorCount: number;
+  audioStartMs: number;
+  audioEndMs: number;
+};
+
 type ActiveBurst = {
   stream: AudioReceiveStream;
   decoder: InstanceType<typeof OpusEncoder>;
+  startMs: number;
+  username: string;
+  packetsReceived: number;
+  decodeErrors: number;
+  pcmStartBytes: number;
 };
 
 type SpeakerRecording = {
@@ -33,19 +50,36 @@ type ReceiveSession = {
   client: Client;
   connection: VoiceConnection;
   sessionDir: string;
+  sessionStartedAt: string;
+  clockStartNs: bigint;
   speakers: Map<string, SpeakerRecording>;
+  segments: SpeechSegment[];
   onStart: (userId: string) => void;
   onDisconnect: () => void;
 };
 
 const sessions = new Map<string, ReceiveSession>();
 
-async function speakerLabel(client: Client, userId: string): Promise<string> {
+function elapsedMs(clockStartNs: bigint): number {
+  return Number((process.hrtime.bigint() - clockStartNs) / 1_000_000n);
+}
+
+const PCM_BYTES_PER_MS = (48_000 * 2 * 2) / 1000;
+
+function pcmBytesToAudioMs(bytes: number): number {
+  return Math.round(bytes / PCM_BYTES_PER_MS);
+}
+
+async function speakerUsername(client: Client, userId: string): Promise<string> {
   const cached = client.users.cache.get(userId);
   const user =
     cached ??
     (await client.users.fetch(userId).catch(() => null));
-  const name = user?.username ?? 'unknown';
+  return user?.username ?? 'unknown';
+}
+
+async function speakerLabel(client: Client, userId: string): Promise<string> {
+  const name = await speakerUsername(client, userId);
   return `${name} (${userId})`;
 }
 
@@ -71,14 +105,28 @@ function createSessionFolder(): string {
   return folder;
 }
 
-function stopBurst(speaker: SpeakerRecording) {
-  if (!speaker.burst) {
+function closeBurst(session: ReceiveSession, speaker: SpeakerRecording) {
+  const burst = speaker.burst;
+  if (!burst) {
     return;
   }
-  const { stream } = speaker.burst;
   speaker.burst = null;
-  stream.removeAllListeners();
-  stream.destroy();
+
+  const endMs = elapsedMs(session.clockStartNs);
+  session.segments.push({
+    userId: speaker.userId,
+    username: burst.username,
+    startMs: burst.startMs,
+    endMs,
+    durationMs: Math.max(0, endMs - burst.startMs),
+    packetCount: burst.packetsReceived,
+    decodeErrorCount: burst.decodeErrors,
+    audioStartMs: pcmBytesToAudioMs(burst.pcmStartBytes),
+    audioEndMs: pcmBytesToAudioMs(speaker.pcmBytes),
+  });
+
+  burst.stream.removeAllListeners();
+  burst.stream.destroy();
 }
 
 function savedAudioPath(filePath: string): string {
@@ -98,86 +146,104 @@ export function startVoiceReceive(connection: VoiceConnection, client: Client) {
 
   const sessionDir = createSessionFolder();
   const speakers = new Map<string, SpeakerRecording>();
-  console.log(`Session audio folder: ${savedAudioPath(sessionDir)}`);
-
-  const onStart = (userId: string) => {
-    let speaker = speakers.get(userId);
-    if (!speaker) {
-      speaker = {
-        userId,
-        writer: new WavWriter(path.join(sessionDir, `${userId}.wav`)),
-        loggedRecording: false,
-        burst: null,
-        packetsReceived: 0,
-        packetsDecoded: 0,
-        decodeErrors: 0,
-        pcmBytes: 0,
-      };
-      speakers.set(userId, speaker);
-    }
-
-    if (speaker.burst) {
-      return;
-    }
-
-    const stream = connection.receiver.subscribe(userId, {
-      end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: 1000,
-      },
-    });
-    const decoder = new OpusEncoder(48_000, 2);
-    speaker.burst = { stream, decoder };
-
-    stream.on('data', (packet: Buffer) => {
-      speaker.packetsReceived += 1;
-      try {
-        const pcm = decoder.decode(packet);
-        speaker.packetsDecoded += 1;
-        speaker.pcmBytes += pcm.length;
-        if (!speaker.loggedRecording) {
-          speaker.loggedRecording = true;
-          void speakerLabel(client, userId).then((label) => {
-            console.log(`Recording audio for: ${label}`);
-          });
-        }
-        speaker.writer.writePcm(pcm);
-      } catch (error) {
-        speaker.decodeErrors += 1;
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(
-          `Dropped corrupt Opus packet for ${userId}: ${packet.length} bytes`,
-        );
-        console.warn(message);
-      }
-    });
-
-    stream.on('error', (error: Error) => {
-      console.error(`Audio stream error for ${userId}`, error);
-    });
-
-    stream.once('end', () => {
-      if (speaker.burst?.stream === stream) {
-        stopBurst(speaker);
-      }
-    });
-  };
-
-  const onDisconnect = () => {
-    void stopVoiceReceive(guildId);
-  };
-
-  connection.receiver.speaking.on('start', onStart);
-  connection.on(VoiceConnectionStatus.Disconnected, onDisconnect);
-  connection.on(VoiceConnectionStatus.Destroyed, onDisconnect);
-
-  sessions.set(guildId, {
+  const session: ReceiveSession = {
     client,
     connection,
     sessionDir,
+    sessionStartedAt: new Date().toISOString(),
+    clockStartNs: process.hrtime.bigint(),
     speakers,
-    onStart,
-    onDisconnect,
+    segments: [],
+    onStart: (userId: string) => {
+      void startBurst(session, userId);
+    },
+    onDisconnect: () => {
+      void stopVoiceReceive(guildId);
+    },
+  };
+  console.log(`Session audio folder: ${savedAudioPath(sessionDir)}`);
+
+  connection.receiver.speaking.on('start', session.onStart);
+  connection.on(VoiceConnectionStatus.Disconnected, session.onDisconnect);
+  connection.on(VoiceConnectionStatus.Destroyed, session.onDisconnect);
+
+  sessions.set(guildId, session);
+}
+
+async function startBurst(session: ReceiveSession, userId: string) {
+  let speaker = session.speakers.get(userId);
+  if (!speaker) {
+    speaker = {
+      userId,
+      writer: new WavWriter(path.join(session.sessionDir, `${userId}.wav`)),
+      loggedRecording: false,
+      burst: null,
+      packetsReceived: 0,
+      packetsDecoded: 0,
+      decodeErrors: 0,
+      pcmBytes: 0,
+    };
+    session.speakers.set(userId, speaker);
+  }
+
+  if (speaker.burst) {
+    return;
+  }
+
+  const stream = session.connection.receiver.subscribe(userId, {
+    end: {
+      behavior: EndBehaviorType.AfterSilence,
+      duration: 1000,
+    },
+  });
+  const decoder = new OpusEncoder(48_000, 2);
+  const burst: ActiveBurst = {
+    stream,
+    decoder,
+    startMs: elapsedMs(session.clockStartNs),
+    username: 'unknown',
+    packetsReceived: 0,
+    decodeErrors: 0,
+    pcmStartBytes: speaker.pcmBytes,
+  };
+  speaker.burst = burst;
+  void speakerUsername(session.client, userId).then((username) => {
+    burst.username = username;
+  });
+
+  stream.on('data', (packet: Buffer) => {
+    speaker.packetsReceived += 1;
+    burst.packetsReceived += 1;
+    try {
+      const pcm = burst.decoder.decode(packet);
+      speaker.packetsDecoded += 1;
+      speaker.pcmBytes += pcm.length;
+      if (!speaker.loggedRecording) {
+        speaker.loggedRecording = true;
+        void speakerLabel(session.client, userId).then((label) => {
+          console.log(`Recording audio for: ${label}`);
+        });
+      }
+      speaker.writer.writePcm(pcm);
+    } catch (error) {
+      speaker.decodeErrors += 1;
+      burst.decodeErrors += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `Dropped corrupt Opus packet for ${userId}: ${packet.length} bytes`,
+      );
+      console.warn(message);
+    }
+  });
+
+  stream.on('error', (error: Error) => {
+    console.error(`Audio stream error for ${userId}`, error);
+  });
+
+  stream.once('end', () => {
+    if (speaker.burst?.stream === stream) {
+      closeBurst(session, speaker);
+    }
   });
 }
 
@@ -195,7 +261,7 @@ export async function stopVoiceReceive(guildId: string) {
 
   const saved: string[] = [];
   for (const speaker of session.speakers.values()) {
-    stopBurst(speaker);
+    closeBurst(session, speaker);
     await speaker.writer.close();
     const label = await speakerLabel(session.client, speaker.userId);
     console.log(`Audio stats for ${label}:`);
@@ -210,4 +276,16 @@ export async function stopVoiceReceive(guildId: string) {
   for (const filePath of saved) {
     console.log(`Saved audio: ${filePath}`);
   }
+
+  session.segments.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+  const manifestPath = path.join(session.sessionDir, 'manifest.json');
+  const manifest = {
+    sessionStartedAt: session.sessionStartedAt,
+    segments: session.segments,
+  };
+  await fs.promises.writeFile(
+    manifestPath,
+    `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+  console.log(`Saved manifest: ${savedAudioPath(manifestPath)}`);
 }
